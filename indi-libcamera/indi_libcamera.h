@@ -45,7 +45,7 @@ struct RpiCamProperties
         T max;
         T def;
     };
-    
+
     ControlRange<float> brightness    = {-1.0f, 1.0f, 0.0f};
     ControlRange<float> contrast      = {0.0f, 15.99f, 1.0f};
     ControlRange<float> saturation    = {0.0f, 15.99f, 1.0f};
@@ -154,9 +154,11 @@ class INDILibCamera : public INDI::CCD
             AdjustAwbRed, AdjustAwbBlue
         };
 
+        INDI::PropertyText  LibCameraVersionTP {1};
         INDI::PropertySwitch AdjustExposureModeSP {0}, AdjustAwbModeSP {0}, AdjustMeteringModeSP {0}, AdjustDenoiseModeSP {0} ;
         INDI::PropertyNumber AdjustmentNP {AdjustAwbBlue + 1};
         INDI::PropertyNumber GainNP {1};
+        INDI::PropertySwitch GainConversionSP {2};
 
         // std::unique_ptr<RPiCamApp> m_CameraApp;
         // std::unique_ptr<RPiCamEncoder> m_CameraEncoder;
@@ -167,7 +169,21 @@ class INDILibCamera : public INDI::CCD
         int m_black_levels[4] {0, 0, 0, 0};
         int m_LiveVideoWidth {-1}, m_LiveVideoHeight {-1};
         uint8_t m_CameraIndex;
+
+        uint32_t m_CaptureWidth = 0;
+        uint32_t m_CaptureHeight = 0;
+
         libcamera::ControlList m_ControlList;
+
+        enum class GainConversionMode
+        {
+            DynamicRange,
+            LowNoise
+        };
+
+        bool readGainConversionMode(GainConversionMode &mode) const;
+        bool writeGainConversionMode(GainConversionMode mode);
+        void updateGainConversionUI();
 
         RpiCamProperties getAvailableCamProperties();
 };

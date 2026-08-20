@@ -389,6 +389,7 @@ class CelestronAUX :
         int aux_tty_read(char *buf, int bufsiz, int timeout, int *n);
         int aux_tty_write (char *buf, int bufsiz, float timeout, int *n);
         bool tty_set_speed(speed_t speed);
+        bool configureSerialPort(bool useFlowControl);
 
         // connection
         bool m_IsRTSCTS {false};
@@ -412,8 +413,8 @@ class CelestronAUX :
         INDI::PropertySwitch CordWrapToggleSP {2};
 
         // Mount Coord wrap Position
-        INDI::PropertySwitch CordWrapPositionSP {4};
-        enum { CORDWRAP_N, CORDWRAP_E, CORDWRAP_S, CORDWRAP_W };
+        INDI::PropertySwitch CordWrapPositionSP {8};
+        enum { CORDWRAP_N, CORDWRAP_NE, CORDWRAP_E, CORDWRAP_SE, CORDWRAP_S, CORDWRAP_SW, CORDWRAP_W, CORDWRAP_NW };
 
         // Cordwrap base (0-encoder/True directions)
         // Use 0-encoders / Sky directions as base for parking and cordwrap

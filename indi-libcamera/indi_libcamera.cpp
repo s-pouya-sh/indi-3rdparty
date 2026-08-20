@@ -31,6 +31,8 @@
 #include "core/rpicam_encoder.hpp"
 #include "output/output.hpp"
 
+#include <libcamera/camera_manager.h>
+
 #include <algorithm>
 #include <cmath>
 #include <vector>
@@ -43,8 +45,19 @@
 #include <libraw.h>
 #include <jpeglib.h>
 
+#include <fstream>
+#include <cerrno>
+#include <cstring>
 
 #define CONTROL_TAB "Controls"
+
+static constexpr const char *DRIVER_NAME = "LibCamera";
+
+namespace
+{
+constexpr const char *HCG_SYSFS =
+    "/sys/module/imx290/parameters/hcg_mode";
+}
 
 static class Loader
 {
@@ -90,7 +103,8 @@ INDILibCamera::INDILibCamera(uint8_t index, std::shared_ptr<libcamera::Camera> c
     setVersion(LIBCAMERA_VERSION_MAJOR, LIBCAMERA_VERSION_MINOR);
     signal(SIGBUS, default_signal_handler);
     auto model = m_ControlList.get(properties::Model).value();
-    auto fullName = std::string("LibCamera ")
+    auto fullName = std::string(DRIVER_NAME)
+              + " "
               + std::string(model)
               + "-"
               + std::to_string(index);
@@ -102,7 +116,7 @@ INDILibCamera::INDILibCamera(uint8_t index, std::shared_ptr<libcamera::Camera> c
 /////////////////////////////////////////////////////////////////////////////
 const char *INDILibCamera::getDefaultName()
 {
-    return "LibCamera";
+    return DRIVER_NAME;
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -621,6 +635,10 @@ RpiCamProperties INDILibCamera::getAvailableCamProperties()
     
     config->validate();
     cam->configure(config.get());
+    // Save the negotiated StillCapture stream size.
+    // This is used to initialize the CCD geometry during Connect().
+    m_CaptureWidth = config->at(0).size.width;
+    m_CaptureHeight = config->at(0).size.height;
     
     const auto &controls = cam->controls();
     
@@ -721,6 +739,10 @@ bool INDILibCamera::initProperties()
     LOGF_DEBUG("Initializing properties for %s", getDeviceName());
     INDI::CCD::initProperties();
 
+    LibCameraVersionTP[0].fill("VERSION", "Version", libcamera::CameraManager::version().c_str());
+    LibCameraVersionTP.fill(getDeviceName(), "LIBCAMERA_VERSION", "LibCamera", INFO_TAB, IP_RO, 60, IPS_IDLE);
+    registerProperty(LibCameraVersionTP);
+
     // Temperature is read-only (sensor temp, no cooler control).
     // IP_RO causes the base class to include CCD-TEMP in FITS automatically.
     TemperatureNP.setPermission(IP_RO);
@@ -773,6 +795,10 @@ bool INDILibCamera::initProperties()
     GainNP[0].fill("GAIN", "Gain", "%.2f", props.gain.min, props.gain.max, 1.00, props.gain.def);
     GainNP.fill(getDeviceName(), "CCD_GAIN", "Gain", IMAGE_CONTROLS_TAB, IP_RW, 60, IPS_IDLE);
 
+    GainConversionSP[0].fill("LCG", "Dynamic Range (LCG)", ISS_ON);
+    GainConversionSP[1].fill("HCG", "Low Noise (HCG)", ISS_OFF);
+    GainConversionSP.fill(getDeviceName(), "GAIN_CONVERSION", "Gain Conversion", IMAGE_CONTROLS_TAB, IP_RW, ISR_1OFMANY, 60, IPS_IDLE);
+
     uint32_t cap = 0;
     cap |= CCD_HAS_BAYER;
     cap |= CCD_HAS_STREAMING;
@@ -810,6 +836,14 @@ bool INDILibCamera::updateProperties()
         defineProperty(TemperatureNP);
         defineProperty(AdjustmentNP);
         defineProperty(GainNP);
+
+        GainConversionMode currentMode;
+        if (readGainConversionMode(currentMode))
+        {
+            defineProperty(GainConversionSP);
+            updateGainConversionUI();
+        }
+
         defineProperty(AdjustExposureModeSP);
         defineProperty(AdjustAwbModeSP);
         defineProperty(AdjustMeteringModeSP);
@@ -820,6 +854,7 @@ bool INDILibCamera::updateProperties()
         deleteProperty(TemperatureNP);
         deleteProperty(AdjustmentNP);
         deleteProperty(GainNP);
+        deleteProperty(GainConversionSP);
         deleteProperty(AdjustExposureModeSP);
         deleteProperty(AdjustAwbModeSP);
         deleteProperty(AdjustMeteringModeSP);
@@ -926,10 +961,30 @@ void INDILibCamera::default_signal_handler(int signal_number)
 bool INDILibCamera::Connect()
 {
     LOGF_INFO("Connecting to %s", getDeviceName());
-    auto pas = m_ControlList.get(properties::PixelArraySize);
-    // no idea why the IMX290 returns an uneven number of pixels, so just round down
-    auto width = 2.0 * (pas->width / 2);
-    auto height = pas->height;
+
+    // Use the negotiated StillCapture stream size when available.
+    // PixelArraySize describes the sensor array and may differ from
+    // the actual capture stream dimensions on some cameras.
+    uint32_t width = m_CaptureWidth;
+    uint32_t height = m_CaptureHeight;
+
+    if (width == 0 || height == 0)
+    {
+        auto pas = m_ControlList.get(properties::PixelArraySize);
+
+        if (pas)
+        {
+            // no idea why the IMX290 returns an uneven number of pixels, so just round down
+            width = 2 * (pas->width / 2);
+            height = pas->height;
+            LOG_WARN("Negotiated stream size unavailable, falling back to PixelArraySize.");
+        }
+        else
+        {
+            LOG_ERROR("Unable to determine CCD size.");
+            return false;
+        }
+    }
 
     PrimaryCCD.setResolution(width, height);
     UpdateCCDFrame(0, 0, width, height);
@@ -1062,6 +1117,28 @@ bool INDILibCamera::ISNewSwitch(const char *dev, const char *name, ISState * sta
             }, true);
             return true;
         }
+
+        // Gain Conversion
+        if (GainConversionSP.isNameMatch(name))
+        {
+            updateProperty(GainConversionSP, states, names, n, [this, names]()
+            {
+                GainConversionMode mode =
+                    (strcmp(names[0], "HCG") == 0)
+                        ? GainConversionMode::LowNoise
+                        : GainConversionMode::DynamicRange;
+
+                if (!writeGainConversionMode(mode))
+                    return false;
+
+                updateGainConversionUI();
+
+                return true;
+            }, true);
+
+            return true;
+        }
+
     }
 
     return INDI::CCD::ISNewSwitch(dev, name, states, names, n);
@@ -1574,3 +1651,79 @@ INDI_PIXEL_FORMAT INDILibCamera::bayerToPixelFormat(const char *bayer)
 
     return INDI_MONO;
 }
+/////////////////////////////////////////////////////////////////////////////
+///
+/////////////////////////////////////////////////////////////////////////////
+bool INDILibCamera::readGainConversionMode(GainConversionMode &mode) const
+{
+    std::ifstream file(HCG_SYSFS);
+
+    if (!file)
+        return false;
+
+    std::string value;
+    file >> value;
+
+    if (!value.empty() &&
+        (value[0] == 'Y' || value[0] == 'y'))
+    {
+        mode = GainConversionMode::LowNoise;
+    }
+    else
+    {
+        mode = GainConversionMode::DynamicRange;
+    }
+
+    return true;
+}
+
+void INDILibCamera::updateGainConversionUI()
+{
+    GainConversionMode mode;
+
+    if (!readGainConversionMode(mode))
+        return;
+
+    GainConversionSP.reset();
+
+    if (mode == GainConversionMode::LowNoise)
+        GainConversionSP[1].setState(ISS_ON);
+    else
+        GainConversionSP[0].setState(ISS_ON);
+
+    GainConversionSP.setState(IPS_OK);
+    GainConversionSP.apply();
+}
+
+bool INDILibCamera::writeGainConversionMode(GainConversionMode mode)
+{
+    std::ofstream file(HCG_SYSFS);
+
+    if (!file)
+    {
+        LOGF_ERROR("No write permission for %s. Configure write permissions or run indiserver with appropriate privileges.",
+                    HCG_SYSFS);
+        return false;
+    }
+
+    if (mode == GainConversionMode::LowNoise)
+        file << '1';
+    else
+        file << '0';
+
+    file.flush();
+
+    if (!file.good())
+    {
+        LOGF_ERROR("Failed writing to %s: %s",
+                    HCG_SYSFS,
+                    strerror(errno));
+        return false;
+    }
+
+    return true;
+}
+
+/////////////////////////////////////////////////////////////////////////////
+///
+/////////////////////////////////////////////////////////////////////////////

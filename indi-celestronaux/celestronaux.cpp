@@ -126,6 +126,13 @@ bool CelestronAUX::Handshake()
     {
         if (getActiveConnection() == serialConnection)
         {
+            // Configure serial port to prevent CP210x DTR/RTS reset on open
+            // AUX/PC port (19200 baud) uses hardware flow control (RTS/CTS)
+            // HC/USB port (9600 baud) does not use flow control
+            bool useFlowControl = (PortTypeSP[PORT_AUX_PC].getState() == ISS_ON);
+            if (!configureSerialPort(useFlowControl))
+                return false;
+
             if (PortTypeSP[PORT_AUX_PC].getState() == ISS_ON)
             {
                 serialConnection->setDefaultBaudRate(Connection::Serial::B_19200);
@@ -331,9 +338,13 @@ bool CelestronAUX::initProperties()
 
     // Cord Wrap Position
     CordWrapPositionSP[CORDWRAP_N].fill("CORDWRAP_N", "North", ISS_ON);
+    CordWrapPositionSP[CORDWRAP_NE].fill("CORDWRAP_NE", "North-East", ISS_ON);
     CordWrapPositionSP[CORDWRAP_E].fill("CORDWRAP_E", "East",  ISS_OFF);
+    CordWrapPositionSP[CORDWRAP_SE].fill("CORDWRAP_SE", "South-East",  ISS_OFF);
     CordWrapPositionSP[CORDWRAP_S].fill("CORDWRAP_S", "South", ISS_OFF);
+    CordWrapPositionSP[CORDWRAP_SW].fill("CORDWRAP_SW", "South-West", ISS_OFF);
     CordWrapPositionSP[CORDWRAP_W].fill("CORDWRAP_W", "West",  ISS_OFF);
+    CordWrapPositionSP[CORDWRAP_NW].fill("CORDWRAP_NW", "North-West",  ISS_OFF);
     CordWrapPositionSP.fill(getDeviceName(), "CORDWRAP_POS", "CW Position", CORDWRAP_TAB, IP_RW, ISR_1OFMANY, 60,  IPS_IDLE);
 
     // Cord Wrap / Park Base
@@ -585,7 +596,7 @@ bool CelestronAUX::updateProperties()
             getCordWrapPosition();
             double cordWrapAngle = range360(m_CordWrapPosition / STEPS_PER_DEGREE);
             LOGF_INFO("Cord Wrap position angle %.2f", cordWrapAngle);
-            CordWrapPositionSP[static_cast<int>(std::floor(cordWrapAngle / 90))].s = ISS_ON;
+            CordWrapPositionSP[static_cast<int>(std::floor(cordWrapAngle / 45))].s = ISS_ON;
             defineProperty(CordWrapPositionSP);
             defineProperty(CordWrapBaseSP);
         }
@@ -1052,14 +1063,26 @@ bool CelestronAUX::ISNewSwitch(const char *dev, const char *name, ISState *state
                 case CORDWRAP_N:
                     m_RequestedCordwrapPos = 0;
                     break;
+                case CORDWRAP_NE:
+                    m_RequestedCordwrapPos = 45;
+                    break;
                 case CORDWRAP_E:
                     m_RequestedCordwrapPos = 90;
+                    break;
+                case CORDWRAP_SE:
+                    m_RequestedCordwrapPos = 135;
                     break;
                 case CORDWRAP_S:
                     m_RequestedCordwrapPos = 180;
                     break;
+                case CORDWRAP_SW:
+                    m_RequestedCordwrapPos = 225;
+                    break;
                 case CORDWRAP_W:
                     m_RequestedCordwrapPos = 270;
+                    break;
+                case CORDWRAP_NW:
+                    m_RequestedCordwrapPos = 315;
                     break;
                 default:
                     m_RequestedCordwrapPos = 0;
@@ -3987,9 +4010,53 @@ bool CelestronAUX::tty_set_speed(speed_t speed)
         return false;
     }
 
+    // Preserve port configuration flags (CLOCAL, HUPCL, CRTSCTS) after baud rate change
+    // AUX/PC port (19200 baud) uses hardware flow control, HC/USB port (9600 baud) does not
+    bool useFlowControl = (PortTypeSP[PORT_AUX_PC].getState() == ISS_ON);
+    tty_setting.c_cflag |= CLOCAL;     // Don't assert DTR/RTS on open
+    tty_setting.c_cflag &= ~HUPCL;     // Don't drop DTR/RTS on close
+    if (useFlowControl)
+        tty_setting.c_cflag |= CRTSCTS;  // AUX/PC needs hardware flow control
+    else
+        tty_setting.c_cflag &= ~CRTSCTS; // HC/USB no flow control
+
     if (tcsetattr(PortFD, TCSANOW, &tty_setting))
     {
         LOGF_ERROR("Error setting tty attributes %s(%d).", strerror(errno), errno);
+        return false;
+    }
+    return true;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////
+/// Configure serial port to prevent CP210x DTR/RTS reset on open/close
+/////////////////////////////////////////////////////////////////////////////////////
+bool CelestronAUX::configureSerialPort(bool useFlowControl)
+{
+    struct termios tty_setting;
+
+    if (tcgetattr(PortFD, &tty_setting))
+    {
+        LOGF_ERROR("Error getting tty attributes for port config: %s(%d).", strerror(errno), errno);
+        return false;
+    }
+
+    // Ignore modem control lines - prevents DTR/RTS assertion on open
+    tty_setting.c_cflag |= CLOCAL;
+    // Don't drop DTR/RTS on close
+    tty_setting.c_cflag &= ~HUPCL;
+    // Hardware flow control: AUX/PC port needs it, HC/USB does not
+    if (useFlowControl)
+        tty_setting.c_cflag |= CRTSCTS;
+    else
+        tty_setting.c_cflag &= ~CRTSCTS;
+
+    // Preserve all other settings (baud rate, parity, data bits, VMIN/VTIME, etc.)
+    // set by INDI base class. Only modify the specific flags above.
+
+    if (tcsetattr(PortFD, TCSANOW, &tty_setting))
+    {
+        LOGF_ERROR("Error setting tty attributes for port config: %s(%d).", strerror(errno), errno);
         return false;
     }
 
@@ -3998,6 +4065,7 @@ bool CelestronAUX::tty_set_speed(speed_t speed)
 
 /////////////////////////////////////////////////////////////////////////////////////
 ///
+
 /////////////////////////////////////////////////////////////////////////////////////
 void CelestronAUX::hex_dump(char *buf, AUXBuffer data, size_t size)
 {
