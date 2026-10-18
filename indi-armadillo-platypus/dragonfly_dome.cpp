@@ -143,7 +143,23 @@ bool DragonFlyDome::updateProperties()
                 LOG_WARN("Parking status is not known.");
             }
             else if (isSensorOn(parkedSensor) != isParked())
-                SetParked(isSensorOn(parkedSensor));
+            {
+                // InitPark() just set the park status from the persisted config (the last
+                // confirmed physical state). A single sensor read right after Connect() can
+                // be a transient glitch (the relio board's I/O lines are not guaranteed to be
+                // settled yet), so before overriding that persisted state, confirm with a
+                // second independent read taken a moment later. Only trust the change if both
+                // reads agree; otherwise keep the persisted state and warn instead of silently
+                // reporting a wrong park status.
+                bool firstReading = isSensorOn(parkedSensor);
+                usleep(200000);
+                updateSensors();
+                bool secondReading = isSensorOn(parkedSensor);
+                if (firstReading == secondReading)
+                    SetParked(secondReading);
+                else
+                    LOG_WARN("Parked sensor reading is unstable right after connection, keeping last known park status.");
+            }
         }
 
         defineProperty(FirmwareVersionTP);
@@ -392,31 +408,28 @@ bool DragonFlyDome::setRoofOpen(bool enabled)
     if (enabled && DigitalOutputsSP[close_relay_idx][INDI::OutputInterface::On].s == ISS_ON)
     {
         LOG_DEBUG("Turning off Close Roof Relay in order to turn on Open Roof relay...");
-        if (!ISNewProperty(DigitalOutputsSP[close_relay_idx], DigitalOutputsSP[close_relay_idx][INDI::OutputInterface::Off].getName(), ISS_ON))
+        // CommandOutput() talks to the hardware and updates DigitalOutputsSP directly, without
+        // going through ISNewProperty()/ISNewSwitch()/processSwitch(). That matters here because
+        // setRoofOpen()/setRoofClose() can be invoked from TimerHit() itself once a motion
+        // completes (see TimerHit() below): re-entering the property dispatch pipeline from
+        // inside TimerHit() corrupts driver state and crashes the process (SIGABRT).
+        if (!CommandOutput(close_relay_idx, INDI::OutputInterface::Off))
         {
             LOG_ERROR("Failed to send command to turn off close relay before opening.");
-            // ISNewProperty updates property states, so we check the actual state
             if (DigitalOutputsSP[close_relay_idx][INDI::OutputInterface::On].s == ISS_ON)
             {
                 LOG_ERROR("Close relay is still ON after attempting to turn it off.");
                 return false; // Safety: don't proceed if we can't turn off the opposing relay
             }
         }
-        // Give a small delay for the command to be processed if needed, or check state
-        // For now, assume ISNewProperty is synchronous enough for the next check or command.
     }
 
-    const char *elementToActivate = enabled ? DigitalOutputsSP[open_relay_idx][INDI::OutputInterface::On].getName()
-                                    : DigitalOutputsSP[open_relay_idx][INDI::OutputInterface::Off].getName();
-    if (!ISNewProperty(DigitalOutputsSP[open_relay_idx], elementToActivate, ISS_ON))
+    // See the comment above: CommandOutput() is the safe, non-reentrant way to drive a relay.
+    if (!CommandOutput(open_relay_idx, enabled ? INDI::OutputInterface::On : INDI::OutputInterface::Off))
     {
         LOGF_ERROR("Failed to send command to %s open relay.", enabled ? "turn on" : "turn off");
         return false;
     }
-    // ISNewProperty returns true if the property is found and processed, not necessarily if the hardware command succeeded.
-    // The property state (IPS_OK, IPS_ALERT) should reflect success.
-    // We rely on OutputInterface::processSwitch to set the correct state.
-    // For the purpose of this function, returning true means the command was dispatched.
     return true;
 }
 
@@ -443,7 +456,8 @@ bool DragonFlyDome::setRoofClose(bool enabled)
     if (enabled && DigitalOutputsSP[open_relay_idx][INDI::OutputInterface::On].s == ISS_ON)
     {
         LOG_DEBUG("Turning off Open Roof relay in order to turn on Close Roof relay...");
-        if (!ISNewProperty(DigitalOutputsSP[open_relay_idx], DigitalOutputsSP[open_relay_idx][INDI::OutputInterface::Off].getName(), ISS_ON))
+        // See setRoofOpen(): CommandOutput() is the safe, non-reentrant way to drive a relay.
+        if (!CommandOutput(open_relay_idx, INDI::OutputInterface::Off))
         {
             LOG_ERROR("Failed to send command to turn off open relay before closing.");
             if (DigitalOutputsSP[open_relay_idx][INDI::OutputInterface::On].s == ISS_ON)
@@ -454,9 +468,7 @@ bool DragonFlyDome::setRoofClose(bool enabled)
         }
     }
 
-    const char *elementToActivate = enabled ? DigitalOutputsSP[close_relay_idx][INDI::OutputInterface::On].getName()
-                                    : DigitalOutputsSP[close_relay_idx][INDI::OutputInterface::Off].getName();
-    if (!ISNewProperty(DigitalOutputsSP[close_relay_idx], elementToActivate, ISS_ON))
+    if (!CommandOutput(close_relay_idx, enabled ? INDI::OutputInterface::On : INDI::OutputInterface::Off))
     {
         LOGF_ERROR("Failed to send command to %s close relay.", enabled ? "turn on" : "turn off");
         return false;
@@ -474,8 +486,12 @@ IPState DragonFlyDome::Move(DomeDirection dir, DomeMotionCommand operation)
         // DOME_CW --> OPEN. If can we are ask to "open" while we are fully opened as the limit switch indicates, then we simply return false.
         if (dir == DOME_CW && isSensorOn(DomeControlSensorNP[SENSOR_UNPARKED].getValue()))
         {
-            LOG_WARN("Roof is already fully opened.");
-            return IPS_ALERT;
+            // Already in the requested state: this is success, not a failure. Returning
+            // IPS_ALERT here breaks idempotent unpark requests (e.g. Scheduler startup after
+            // the roof was opened manually) and leaves m_DomeState out of sync with reality.
+            LOG_INFO("Roof is already fully opened.");
+            SetParked(false);
+            return IPS_OK;
         }
         //         else if (dir == DOME_CW && getWeatherState() == IPS_ALERT)
         //         {
@@ -484,8 +500,9 @@ IPState DragonFlyDome::Move(DomeDirection dir, DomeMotionCommand operation)
         //         }
         else if (dir == DOME_CCW && isSensorOn(DomeControlSensorNP[SENSOR_PARKED].getValue()))
         {
-            LOG_WARN("Roof is already fully closed.");
-            return IPS_ALERT;
+            LOG_INFO("Roof is already fully closed.");
+            SetParked(true);
+            return IPS_OK;
         }
         else if (dir == DOME_CCW && INDI::Dome::isLocked())
         {

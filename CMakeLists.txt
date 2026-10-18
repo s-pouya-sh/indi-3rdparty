@@ -203,6 +203,7 @@ option(WITH_EQMOD "Install EQMod Driver" On)
 option(WITH_ASTARBOX "Install AStarBox Driver" On)
 option(WITH_STARBOOK "Install Starbook Driver" On)
 option(WITH_STARBOOK_TEN "Install Starbook Ten Driver" On)
+option(WITH_TYR "Install Prometheus Astro Tyr telescope driver" On)
 option(WITH_CAUX "Install Celestron AUX Driver" On)
 option(WITH_SX "Install StarLight Xpress Driver" On)
 option(WITH_MAXDOME "Install MaxDomeII Driver" On)
@@ -322,8 +323,6 @@ if(${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
   # The drivers below are not yet compatible with Apple Silicon since their libraries are not universal binaries
   if(CMAKE_OSX_ARCHITECTURES STREQUAL "arm64")
     set(WITH_SBIG Off)
-    set(WITH_ATIK Off)
-    set(WITH_SVBONY Off)
     set(WITH_SVBONYCAM Off)
     set(WITH_ASTROASIS Off)    
   endif()
@@ -470,6 +469,10 @@ if(BUILD_LIBS)
 
   # This is the main 3rd Party build.  It runs if the Build Libs option is not selected.
 else(BUILD_LIBS)
+  ## Prometheus Astro Tyr
+  if(WITH_TYR)
+    add_subdirectory(indi-tyr)
+  endif(WITH_TYR)
   ## TicFocuser-ng
   if(WITH_TICFOCUSER-NG)
     add_subdirectory(indi-ticfocuser-ng)
